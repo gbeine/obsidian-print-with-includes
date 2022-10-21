@@ -1,81 +1,54 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import {
+	App,
+	Plugin,
+	PluginSettingTab,
+	Setting,
+	TFile,
+	TFolder,
+	Vault
+} from 'obsidian';
 
-// Remember to rename these classes and interfaces!
-
-interface MyPluginSettings {
-	mySetting: string;
+interface ObsidianPrintWithIncludesPluginSettings {
+	fileExtension: string;
+	outputPrefix: string;
+	cleanupNewlines: boolean;
 }
 
-const DEFAULT_SETTINGS: MyPluginSettings = {
-	mySetting: 'default'
+const DEFAULT_SETTINGS: ObsidianPrintWithIncludesPluginSettings = {
+	fileExtension: '.md',
+	outputPrefix: 'P_W_I_',
+	cleanupNewlines: true,
 }
 
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+export default class ObsidianPrintWithIncludesPlugin extends Plugin {
+	settings: ObsidianPrintWithIncludesPluginSettings;
 
 	async onload() {
 		await this.loadSettings();
 
-		// This creates an icon in the left ribbon.
-		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
-		// Perform additional things with the ribbon
-		ribbonIconEl.addClass('my-plugin-ribbon-class');
-
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status Bar Text');
-
-		// This adds a simple command that can be triggered anywhere
-		this.addCommand({
-			id: 'open-sample-modal-simple',
-			name: 'Open sample modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'sample-editor-command',
-			name: 'Sample editor command',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				console.log(editor.getSelection());
-				editor.replaceSelection('Sample Editor Command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-sample-modal-complex',
-			name: 'Open sample modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
-
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-			}
-		});
-
 		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
+		this.addSettingTab(new PrintWithIncludesPluginSettingTab(this.app, this));
 
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			console.log('click', evt);
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
+		this.registerEvent(
+			this.app.workspace.on("file-menu", (menu, file) => {
+				menu.addItem((item) => {
+					item
+						.setTitle("Print this file with includes 👈")
+						.setIcon("document")
+						.onClick(async () => {
+							// TODO: add test for markdown file
+							if (file instanceof TFile) {
+								let result = new PrintWithIncludesResult(this.settings.cleanupNewlines);
+								await new FilePrintWithIncludes(file, this.app.vault, result, this.settings.fileExtension)
+									.run();
+								// TODO: make output path configurable
+								let path = file.parent.path + "/" + this.settings.outputPrefix + file.name;
+								result.print(path, this.app.vault);
+							}
+						});
+				});
+			})
+		);
 	}
 
 	onunload() {
@@ -91,26 +64,104 @@ export default class MyPlugin extends Plugin {
 	}
 }
 
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
+class FilePrintWithIncludes {
+	file: TFile;
+	folder: TFolder;
+	vault: Vault;
+	result: PrintWithIncludesResult;
+	fileExtension: string;
+
+	constructor(file: TFile, vault: Vault, result: PrintWithIncludesResult, fileExtension: string) {
+		this.file = file;
+		this.folder = file.parent;
+		this.vault = vault;
+		this.result = result;
+		this.fileExtension = fileExtension;
 	}
 
-	onOpen() {
-		const {contentEl} = this;
-		contentEl.setText('Woah!');
+	async run(): Promise<void> {
+		const content = await this.readContentWithoutFrontMatter(this.file);
+		for (let line of content) {
+			if (line.startsWith("#") && line.includes("[[") && line.includes("]]") && line.includes("|")) {
+				await this.parseInclude(line);
+			} else {
+				this.result.addLine(line);
+			}
+		}
 	}
 
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
+	async parseInclude(value: string) : Promise<void> {
+		let head = /^(#+)*/.exec(value);
+		if (!head || head.length != 2) {
+			console.log("Error: cannot parse header level");
+			return;
+		}
+		let link = /\[\[([^\|]*)\|(.*)\]\]/.exec(value);
+		if (!link || link.length != 3) {
+			console.log("Error: cannot parse link :-(")
+			return;
+		}
+		let result = head[1] + " " + link[2];
+		this.result.addLine(result);
+		this.result.addLine("");
+		await this.include(link[1]);
+	}
+
+	async include(path: string) : Promise<void> {
+		console.log("include", path);
+		const file = this.vault.getAbstractFileByPath(path + this.fileExtension);
+		if (file instanceof TFile) {
+			await new FilePrintWithIncludes(file, this.vault, this.result, this.fileExtension)
+				.run();
+		}
+	}
+
+	async readContent(file: TFile) : Promise<string[]> {
+		console.log('readContent', this.file.path);
+		const content = await this.vault.cachedRead(file);
+		const lines = content.split("\n");
+		return lines;
+	}
+
+	async readContentWithoutFrontMatter(file: TFile) : Promise<string[]> {
+		console.log('readContentWithoutFrontMatter', this.file.path);
+		let lines = await this.readContent(file);
+		let frontMatterCache = app.metadataCache.getFileCache(file)?.frontmatter;
+		if (frontMatterCache) {
+			let end = frontMatterCache.position.end.line + 1
+			lines = lines.slice(end)
+		}
+		return lines;
 	}
 }
 
-class SampleSettingTab extends PluginSettingTab {
-	plugin: MyPlugin;
+class PrintWithIncludesResult {
+	lines: string[] = []
+	cleanupNewlines: boolean;
 
-	constructor(app: App, plugin: MyPlugin) {
+	constructor(cleanupNewlines: boolean) {
+		this.cleanupNewlines = cleanupNewlines;
+	}
+
+	addLine(line: string) : void {
+		console.log(line);
+		this.lines.push(line);
+	}
+
+	print(path: string, vault: Vault) : void {
+		console.log("print", path);
+		let content = this.lines.join("\n");
+		if (this.cleanupNewlines) {
+			content = content.replace(/\n{2,}/g,"\n\n");
+		}
+		vault.create(path, content);
+	}
+}
+
+class PrintWithIncludesPluginSettingTab extends PluginSettingTab {
+	plugin: ObsidianPrintWithIncludesPlugin;
+
+	constructor(app: App, plugin: ObsidianPrintWithIncludesPlugin) {
 		super(app, plugin);
 		this.plugin = plugin;
 	}
@@ -120,18 +171,44 @@ class SampleSettingTab extends PluginSettingTab {
 
 		containerEl.empty();
 
-		containerEl.createEl('h2', {text: 'Settings for my awesome plugin.'});
+		containerEl.createEl('h2', {text: 'Settings for Print With Includes plugin.'});
 
 		new Setting(containerEl)
-			.setName('Setting #1')
-			.setDesc('It\'s a secret')
-			.addText(text => text
-				.setPlaceholder('Enter your secret')
-				.setValue(this.plugin.settings.mySetting)
-				.onChange(async (value) => {
-					console.log('Secret: ' + value);
-					this.plugin.settings.mySetting = value;
-					await this.plugin.saveSettings();
-				}));
+			.setName("File extension")
+			.setDesc("File extension used for Markdown files (for including, output...).")
+			.addText((text) =>
+				text
+					.setPlaceholder(DEFAULT_SETTINGS.fileExtension)
+					.setValue(this.plugin.settings.fileExtension)
+					.onChange(async (value) => {
+						this.plugin.settings.fileExtension = value;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Output file prefix")
+			.setDesc("The prefix used for the output file.")
+			.addText((text) =>
+				text
+					.setPlaceholder(DEFAULT_SETTINGS.outputPrefix)
+					.setValue(this.plugin.settings.outputPrefix)
+					.onChange(async (value) => {
+						this.plugin.settings.outputPrefix = value;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Cleanup newlines")
+			.setDesc("Check this to clean up unnecessary multiple newlines in Markdown output.")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.cleanupNewlines)
+					.onChange(async (value) => {
+						this.plugin.settings.cleanupNewlines = value;
+						await this.plugin.saveSettings();
+					})
+			);
 	}
 }
